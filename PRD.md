@@ -1413,6 +1413,586 @@ vredsum.vs vd, vs2   // 向量求和归约
 
 ---
 
+#### 16.3.6 浮点指令详细 UOP 编码表
+
+##### A. F 扩展（单精度浮点）基础算术 UOP
+
+**fadd.s / fsub.s — 浮点加/减**
+
+| 字段 | 值 | 说明 |
+|------|-----|------|
+| exec_unit | 16'b00010000_00000000 (bit11=FPU_S) | 单精度浮点单元 |
+| uop_op | 9'b1100_00000 / 9'b1100_00001 | FP_arith: fadd/fsub |
+| src1_valid | 1'b1 | rs1有效 |
+| src1_type | 2'b00 | 寄存器 |
+| src1_width | 2'b10 | 32-bit |
+| src1_reg | f[rs1] (5b) | 浮点源寄存器1 |
+| src2_valid | 1'b1 | rs2有效 |
+| src2_type | 2'b00 | 寄存器 |
+| src2_width | 2'b10 | 32-bit |
+| src2_reg | f[rs2] (5b) | 浮点源寄存器2 |
+| src3_valid | 1'b0 | 无第3操作数 |
+| dst_valid | 1'b1 | rd有效 |
+| dst_type | 2'b01 | 浮点寄存器 |
+| dst_width | 2'b10 | 32-bit |
+| dst_reg | f[rd] (5b) | 浮点目的寄存器 |
+| sub_opcode | 3'b000 | 默认舍入模式 |
+
+**fmul.s — 浮点乘法**
+
+| 字段 | 值 | 说明 |
+|------|-----|------|
+| uop_op | 9'b1100_00010 | FP_arith: fmul |
+| exec_cycles | 3'b010 | 2 cycles (乘法流水线) |
+
+**fdiv.s / fsqrt.s — 浮点除法/开方**
+
+| 字段 | 值 | 说明 |
+|------|-----|------|
+| uop_op | 9'b1100_00011 / 9'b1100_00100 | fdiv / fsqrt |
+| exec_cycles | 3'b110 | 6-28 cycles (迭代器) |
+| exception | [2] 除法错误 / [1] 溢出 | 除法异常标记 |
+
+##### B. FMA（融合乘加）UOP — 4 操作数
+
+**fmadd.s — 浮点融合乘加 (rd = rs1 × rs2 + rs3)**
+
+| 字段 | 值 | 说明 |
+|------|-----|------|
+| exec_unit | 16'b00010000_00000000 | FPU_S |
+| uop_op | 9'b1111_00000 | FP_MA: fmadd |
+| src1_valid | 1'b1 | 乘数1 (rs1) |
+| src2_valid | 1'b1 | 乘数2 (rs2) |
+| src3_valid | 1'b1 | 加数 (rs3) — 复用src3字段 |
+| sub_opcode[2] | 1'b0 | A×B+C (fmadd) |
+| sub_opcode[1] | 1'b0 | 正号C |
+| sub_opcode[0] | 1'b0 | A×B (非 -A×B) |
+
+**FMA 变体 sub_opcode 编码：**
+
+| 指令 | sub_opcode[2:0] | 数学含义 |
+|------|-----------------|---------|
+| fmadd | 3'b000 | A×B + C |
+| fmsub | 3'b001 | A×B - C |
+| fnmadd | 3'b010 | -A×B + C |
+| fnmsub | 3'b011 | -A×B - C |
+
+##### C. 浮点比较 UOP — 结果写入整数寄存器
+
+**feq.s / flt.s / fle.s — 浮点比较**
+
+| 字段 | 值 | 说明 |
+|------|-----|------|
+| uop_op | 9'b1101_00000 / 00001 / 00010 | FP_compare |
+| dst_valid | 1'b1 | rd有效 |
+| dst_type | 2'b00 | **整数寄存器** (比较结果写入x[]) |
+| dst_width | 2'b10 | 32-bit (零扩展到XLEN) |
+| dst_reg | x[rd] (5b) | 整数目的寄存器 |
+
+**fmin.s / fmax.s — 浮点最小/最大（浮点结果）**
+
+| 字段 | 值 | 说明 |
+|------|-----|------|
+| uop_op | 9'b1101_00011 / 00100 | fmin / fmax |
+| dst_type | 2'b01 | **浮点寄存器** (结果写入f[]) |
+
+##### D. 浮点移动/类型转换 UOP
+
+**fmv.x.s — 浮点→整数（bit级移动）**
+
+| 字段 | 值 | 说明 |
+|------|-----|------|
+| uop_op | 9'b1011_00000 | FP_move: fmv.x.f |
+| exec_unit | ALU0-3 (整数) | **整数ALU执行** (直接复制，无FP参与) |
+| src1_type | 2'b00 | 寄存器 (浮点源) |
+| src1_reg | f[rs1] | 浮点源寄存器 |
+| dst_type | 2'b00 | 整数寄存器 |
+| exception | = 0 | 无异常 (NaN不触发) |
+
+**fmv.s.x — 整数→浮点（bit级移动）**
+
+| 字段 | 值 | 说明 |
+|------|-----|------|
+| uop_op | 9'b1011_00001 | FP_move: fmv.f.x |
+| exec_unit | ALU0-3 (整数) | **整数ALU执行** |
+| src1_type | 2'b00 | 寄存器 (整数源) |
+| src1_reg | x[rs1] | 整数源寄存器 |
+| dst_type | 2'b01 | 浮点寄存器 |
+
+**fcvt.s.w / fcvt.w.s — 整数↔浮点转换**
+
+| 指令 | src1_type | src1_width | dst_type | dst_width | uop_op |
+|------|-----------|------------|----------|-----------|--------|
+| fcvt.s.w (int→float) | Register | 32-bit | F | 32-bit | 9'b1110_00011 |
+| fcvt.w.s (float→int) | Register | 32-bit | X | 32-bit | 9'b1110_00010 |
+
+##### E. D 扩展（双精度浮点）UOP — 格式与 F 扩展相同，仅宽度不同
+
+**fadd.d / fmul.d / fdiv.d — 双精度浮点**
+
+| 字段 | 值 | 说明 |
+|------|-----|------|
+| exec_unit | FPU_D (bit12) | 双精度浮点单元 |
+| src1_width / src2_width | 2'b11 | **64-bit** (区别于单精度) |
+| dst_width | 2'b11 | 64-bit |
+| uop_op[0] | 编码复用 | 与单精度相同，通过width区分 |
+
+**fcvt.d.s / fcvt.s.d — 单↔双精度互转**
+
+| 指令 | src_width | dst_width | uop_op | 执行单元 |
+|------|-----------|-----------|--------|----------|
+| fcvt.s.d (双→单) | 64-bit | 32-bit | 9'b1110_00001 | FPU_D |
+| fcvt.d.s (单→双) | 32-bit | 64-bit | 9'b1110_00000 | FPU_D |
+
+---
+
+#### 16.3.7 Zfa / Zicond 扩展 UOP 编码
+
+##### A. Zfa 扩展附加浮点指令
+
+**fli.s / fli.d — 浮点立即数加载**
+
+| 立即数 | sub_opcode | 值 (IEEE754) | 说明 |
+|--------|-----------|-------------|------|
+| 0 | 3'b000 | +0.0 | |
+| min | 3'b001 | +最小规格化数 | 2^(-126) / 2^(-1022) |
+| 1 | 3'b010 | +1.0 | |
+| max | 3'b011 | +最大有限数 | 2^127(2-2^-23) |
+| inf | 3'b100 | +∞ | |
+| nan | 3'b101 | NaN (canonical) | |
+
+| 字段 | 值 | 说明 |
+|------|-----|------|
+| uop_op | 9'b1011_00100 | Zfa_ext: fli |
+| src1_valid | 1'b0 | **无源操作数** (立即数硬编码在sub_opcode) |
+| src2_valid | 1'b0 | |
+| sub_opcode[2:0] | 表中值 | 选择预定义立即数 |
+| dst_valid | 1'b1 | rd有效 |
+| dst_type | F | 浮点寄存器 |
+| exec_unit | FPU_S/D | |
+
+**fminm.s / fmaxm.s — NaN传播版本 min/max**
+
+| 字段 | 值 | 说明 |
+|------|-----|------|
+| uop_op | 9'b1011_00101 / 00110 | fminm / fmaxm |
+| 与标准fmin/fmax区别 | sub_opcode[0]=1 | NaN传播: 任一NaN则返回NaN |
+
+**fround.s / froundnx.s — 舍入到整数**
+
+| 指令 | sub_opcode[0] | 舍入模式 | 是否精确 |
+|------|---------------|---------|---------|
+| fround.s | 0 | 动态 (frm) | 精确 (设置inexact) |
+| froundnx.s | 1 | 动态 (frm) | 可能不精确 (跳过inexact) |
+
+**fclass.s — 浮点分类（结果写入整数寄存器）**
+
+| 字段 | 值 | 说明 |
+|------|-----|------|
+| uop_op | 9'b1011_00111 | fclass |
+| exec_unit | FPU_S/D | |
+| src1_valid | 1'b1 | 待分类浮点值 |
+| dst_type | 2'b00 | **整数寄存器** |
+| dst_width | 2'b10 | 32-bit |
+| dst_reg | x[rd] | |
+
+**fclass 输出编码 (10-bit):**
+
+| bit | 含义 |
+|-----|------|
+| [0] | -∞ |
+| [1] | -正常 |
+| [2] | -次正常 |
+| [3] | -0 |
+| [4] | +0 |
+| [5] | +次正常 |
+| [6] | +正常 |
+| [7] | +∞ |
+| [8] | sNaN |
+| [9] | qNaN |
+
+##### B. Zicond 扩展 — 整数条件选择（无浮点，但影响浮点load/store）
+
+**czero.eqz / czero.nez — 条件置零**
+
+| 指令 | uop_op | sub_opcode[0] | 语义 |
+|------|--------|---------------|------|
+| czero.eqz rd, rs1, rs2 | 9'b0001_01000 | 0 | (rs2==0) ? 0 : rs1 |
+| czero.nez rd, rs1, rs2 | 9'b0001_01001 | 1 | (rs2!=0) ? 0 : rs1 |
+
+| 字段 | 值 | 说明 |
+|------|-----|------|
+| exec_unit | ALU0-3 | 整数ALU |
+| src1_valid | 1'b1 | 候选值 (rs1) |
+| src2_valid | 1'b1 | 条件检测 (rs2) |
+| src3_valid | 1'b0 | |
+| dst_type | 2'b00 | 整数寄存器 |
+
+---
+
+#### 16.3.8 向量指令详细 UOP 编码（算术/逻辑/比较）
+
+##### A. 向量 UOP 格式扩展字段
+
+向量 UOP 复用基础 64-bit UOP 格式，但将 [46:17] 的 imm_field 区域作为**向量专用字段**：
+
+```
+复用 src_type/width/valid 区域作为向量字段：
+┌───────────────────────────────────────────────────────────────┐
+│ 字段                    │ 位宽  │ 说明                        │
+├───────────────────────────────────────────────────────────────┤
+│ vl                      │ [46:42](5b) │ 向量长度 (0-31, 或用VL寄存器) │
+│ sew[2:0]                │ [41:39](3b) │ 元素宽度编码 (8/16/32/64)    │
+│ lmul[1:0]               │ [38:37](2b) │ LMUL (1/2/4/8)                │
+│ vma                     │ [36] (1b)   │ 掩码寄存器 v0 是否参与         │
+│ vta                     │ [35] (1b)   │ 尾元素处理 (1=未定义/0=保持)  │
+│ vs2_reg                 │ [31:27](5b) │ vs2 寄存器组起始号            │
+│ vs1_reg                 │ [21:17](5b) │ vs1 寄存器组起始号            │
+└───────────────────────────────────────────────────────────────┘
+```
+
+**SEW 编码：**
+
+| sew[2:0] | 宽度 | 说明 |
+|----------|------|------|
+| 000 | 8 bits | |
+| 001 | 16 bits | |
+| 010 | 32 bits | |
+| 011 | 64 bits | |
+| 100 | 128 bits | (E 扩展预留) |
+
+**LMUL 编码：**
+
+| lmul[1:0] | 寄存器数 | 寄存器组大小 |
+|-----------|---------|-------------|
+| 00 | 1 | 1 vreg |
+| 01 | 2 | 连续 2 vregs |
+| 10 | 4 | 连续 4 vregs |
+| 11 | 8 | 连续 8 vregs |
+
+##### B. 向量算术 UOP 编码表
+
+**vadd.vv vd, vs1, vs2 — 向量-向量加法**
+
+| 字段 | 值 | 说明 |
+|------|-----|------|
+| exec_unit | VPU_LANE0 + VPU_LANE1 (bits14:13) | 两个向量通道并行 |
+| uop_op | 9'b0001_10000 | add_sub 类别 + 向量标志 (bit4=1) |
+| dst_valid | 1'b1 | vd 寄存器组起始号 |
+| dst_type | V (2'b10) | 向量寄存器类型 |
+| dst_reg | v[vd_base] | 起始寄存器号 |
+| src1_valid | 1'b1 | vs1 源寄存器组 |
+| src1_type | V | 向量寄存器类型 |
+| src2_valid | 1'b1 | vs2 源寄存器组 |
+| src2_type | V | 向量寄存器类型 |
+| sew / lmul | 来自 vsetvli | 当前向量配置 |
+| vma | 0/1 | 是否使用 v0 掩码 |
+
+**向量算术 UOP 操作码映射（在 add_sub/multiply 类别中通过 bit4 区分标量/向量）：**
+
+| 指令 | 基础类别 UOPOP[8:5] | bit4 (向量) | 低4位操作 |
+|------|---------------------|------------|----------|
+| vadd.vv/vx | 0001 (add_sub) | 1 (向量) | 0000 = add |
+| vsub.vv/vx | 0001 | 1 | 0001 = sub |
+| vrsub.vx | 0001 | 1 | 0010 = reverse sub |
+| vmul.vv/vx | 0101 (multiply) | 1 | 0000 = mul |
+| vmulh.vv/vx | 0101 | 1 | 0001 = mulh |
+| vdiv.vv/vx | 0110 (division) | 1 | 0000 = div |
+| vrem.vv/vx | 0110 | 1 | 0001 = rem |
+
+**向量算术 UOP 源操作数变体：**
+
+| 变体 | src1_type | 说明 |
+|------|-----------|------|
+| vadd.vv | V (2'b10) | 向量-向量 |
+| vadd.vx | X (2'b00) | 向量-整数标量 |
+| vadd.vi | Immediate (2'b01) | 向量-立即数 |
+
+##### C. 向量逻辑/比较 UOP
+
+| 指令 | uop_op | 类别 | 操作 |
+|------|--------|------|------|
+| vand.vv | 9'b0011_10000 | logic (向量) | AND |
+| vor.vv | 9'b0011_10001 | logic (向量) | OR |
+| vxor.vv | 9'b0011_10010 | logic (向量) | XOR |
+| vsll.vv | 9'b0111_10000 | shift (向量) | 左移 |
+| vsrl.vv | 9'b0111_10001 | shift (向量) | 右移 |
+| vsra.vv | 9'b0111_10010 | shift (向量) | 算术右移 |
+
+**向量比较 UOP（结果写入 v0 掩码寄存器）：**
+
+| 指令 | uop_op | dst_reg | dst_type | 说明 |
+|------|--------|---------|----------|------|
+| vmseq.vv | 9'b0010_10000 | v0 | V (掩码) | mask[i] = (vs1[i]==vs2[i]) |
+| vmsne.vv | 9'b0010_10001 | v0 | V (掩码) | mask[i] = (vs1[i]!=vs2[i]) |
+| vmslt.vv | 9'b0010_10010 | v0 | V (掩码) | mask[i] = (vs1[i]<vs2[i]) |
+| vmsle.vv | 9'b0010_10011 | v0 | V (掩码) | mask[i] = (vs1[i]<=vs2[i]) |
+
+##### D. 向量浮点 UOP（Zve64f 扩展）
+
+| 指令 | uop_op | 执行单元 | 说明 |
+|------|--------|----------|------|
+| vfadd.vv | 9'b1100_10000 | FPU_S/D + VPU | 向量浮点加 |
+| vfsub.vv | 9'b1100_10001 | FPU_S/D + VPU | 向量浮点减 |
+| vfmul.vv | 9'b1100_10010 | FPU_S/D + VPU | 向量浮点乘 |
+| vfdiv.vv | 9'b1100_10011 | FPU_S/D + VPU | 向量浮点除 |
+| vfmacc.vv | 9'b1111_10000 | FPU_S/D + VPU | 向量 FMA (vs1×vs2+vd→vd) |
+| vfmin.vv | 9'b1101_10000 | FPU_S/D + VPU | 向量浮点 min |
+| vfmax.vv | 9'b1101_10001 | FPU_S/D + VPU | 向量浮点 max |
+
+---
+
+#### 16.3.9 向量 Load/Store 寻址模式 UOP 拆分
+
+##### A. 单位 stride（常规向量 load/store）
+
+**vle32.v vd, (rs1) — 向量加载（单位步长）**
+
+| 步骤 | UOP | exec_unit | 说明 |
+|------|-----|-----------|------|
+| 1 | UOP#1 | ALU | base = rs1 (零计算，寄存器直传) |
+| 2 | UOP#2 | LOAD + VPU_LANE0 | 加载元素 0 → vd[0] |
+| 3 | UOP#3 | LOAD + VPU_LANE1 | 加载元素 1 → vd[1] |
+| 4 | UOP#4 | LOAD + VPU_LANE0 | 加载元素 2 → vd[2] |
+| ... | ... | ... | 依次加载 (硬件循环，2通道交错) |
+
+**关键优化：** 2 个 VPU 通道 + 2 个 LOAD 单元可并行加载 4 个元素/周期。
+
+##### B. Stride 寻址（固定步长）
+
+**vls32.v vd, (rs1), rs2 — 步长加载**
+
+| 步骤 | UOP | 说明 |
+|------|-----|------|
+| 1 | UOP#1 | stride 计算: stride_bytes = rs2 × (SEW/8) |
+| 2 | UOP#2 | addr_i = rs1 + i × stride_bytes (循环生成) |
+| 3-N | UOP#3..N | 依次加载每个非连续地址 |
+
+**注意：** stride 加载性能低于 unit-stride，因为地址非连续，cache line 利用率较低。
+
+##### C. Index 寻址（散乱/聚集，scatter/gather）
+
+**vloxei32.v vd, (rs1), vs2 — 索引加载 (gather)**
+
+| 步骤 | UOP | 说明 |
+|------|-----|------|
+| 1 | UOP#1 | 初始化 gather 上下文 |
+| 2-N | UOP#2..N | addr_i = rs1 + sign_extend(vs2[i])×4；每步独立地址计算 |
+| N+1 | UOP#N+1 | 最终元素处理 |
+
+**关键：** Gather/Scatter 每个元素地址独立，无法并行 L1D 命中，必须每次独立计算 + 访问。可考虑的优化：
+- 地址对齐检测 → 连续地址合并为 stride load
+- MSHR 复用 → 多个 scatter 写入同一 cache line 时合并
+
+##### D. 向量 Store 指令拆分
+
+**vse32.v vs3, (rs1) — 向量存储（单位步长）**
+
+| 步骤 | UOP | exec_unit | 说明 |
+|------|-----|-----------|------|
+| 1 | UOP#1 | ALU + STORE | 首地址计算 + 数据对齐准备 |
+| 2-N | UOP#2..N | STORE | 每个元素依次写入；写回队列 buffer 合并 |
+
+##### E. Masked Load/Store（掩码加载）
+
+**vle32.v vd, (rs1), v0.t — 带掩码加载**
+
+| 额外步骤 | UOP | 说明 |
+|---------|-----|------|
+| 掩码预读取 | 嵌入每个 load UOP | 每个 load 检查 v0[i]，若为0则跳过写回 (store 则写入 skip) |
+
+##### F. 向量 Load/Store UOP 字段编码
+
+| 字段 | vle32.v (load) | vse32.v (store) |
+|------|---------------|-----------------|
+| exec_unit | LOAD (bit6) + VPU_LANE0/1 | STORE (bit7) |
+| uop_op | 9'b1000_10000 | 9'b1000_10010 |
+| src1_valid | √ (rs1 base) | √ (rs1 base) |
+| src2_valid | × | √ (vs3 数据) |
+| src3_valid | × (单位步长) 或 √ (stride: rs2) 或 √ (index: vs2) | 同左 |
+| sew | 32-bit (编码 010) | 32-bit |
+| vlm | 0 (scalar) / 1 (索引) | 同左 |
+| vma | 是否使用 v0 掩码 | 同左 |
+
+---
+
+#### 16.3.10 向量配置/归约/跨界 UOP
+
+##### A. 向量配置指令 UOP — vsetvli / vsetvl
+
+**vsetvli t0, t1, e32, m2, ta, ma**
+
+| 步骤 | UOP | exec_unit | 说明 |
+|------|-----|-----------|------|
+| 1 | UOP#1 | ALU + CSR | 计算 vl = vsetvl_max(t1, vlenb*lmul/sew) |
+| 2 | UOP#2 | CSR (bit15) | 写入 vtype (SEW, LMUL, TA, MA) 到 vtype CSR |
+| 3 | UOP#3 | CSR (bit15) | 写入 vl CSR = 计算值 |
+
+| 字段 | 值 | 说明 |
+|------|-----|------|
+| exec_unit | CSR (bit15) | CSR 单元处理 |
+| uop_op | 9'b1010_10000 | CSR 类别 + 向量配置标志 |
+| src1_valid | 1'b1 | t1 (请求的元素数) |
+| sub_opcode[2:0] | 编码 e32/m2/ta/ma | 配置参数编码 |
+| dst_valid | 1'b1 | t0 (返回的 vl) |
+| dst_type | 2'b00 | 整数寄存器 |
+
+**关键约束：** vsetvli 必须串行化——所有前面的向量 UOP 必须 complete 后才能生效，因此在 dispatch 时会插入 barrier 标记。
+
+##### B. 向量归约 UOP — vredsum
+
+**vredsum.vs vd, vs2, vs1**
+
+| 步骤 | UOP | 说明 |
+|------|-----|------|
+| 1 | UOP#1 | 初始化累加器: acc[0..SEW-1] = vs1[0] |
+| 2 | UOP#2..L | acc += vs2[i], i = 1..L-1 (串行累加) |
+| L+1 | UOP#L+1 | vd[0] = acc; vd[1..] = 保持 (TAmode) 或 清零 |
+
+**并行归约优化（可选，面积换性能）：**
+- vredsum 改为 log2(vl) 级树形结构：
+  - 第1级: (vl/2) 对两两相加
+  - 第2级: (vl/4) 对两两相加
+  - ... → 最终 1 个结果
+- 对于 Zve64x + LMUL=1, vl=8 时：8→4→2→1 共 3 级（原需 7 次串行）
+
+**向量归约 UOP 编码：**
+
+| 指令 | uop_op | 类别 | 说明 |
+|------|--------|------|------|
+| vredsum.vs | 9'b0001_10100 | add_sub (向量) | 求和归约 |
+| vredmaxu.vs | 9'b1101_10010 | FP_compare (向量) | 无符号 max 归约 |
+| vredand.vs | 9'b0011_10100 | logic (向量) | AND 归约 |
+
+##### C. 向量跨界（跨界寄存器处理）
+
+当 LMUL > 1 且向量起始寄存器号非 LMUL 对齐时，需要处理跨界：
+
+**场景示例：** LMUL=4, vs2 起始号=3 (跨越 v3→v6)
+
+| 问题 | UOP 处理 | 说明 |
+|------|---------|------|
+| 地址映射 | 硬件计算实际寄存器组 | vs2[0]→v3, vs2[1]→v4, vs2[2]→v5, vs2[3]→v6 |
+| 向量长度 | 若 vl > 余量 | 跨界需要分两批加载/执行 |
+| UOP#1 | 前缀计算 | 计算跨界起始偏移 |
+| UOP#2..N | 正常执行 | 使用偏移后的寄存器映射 |
+
+##### D. 向量 Mask UOP
+
+**vmv.v.vd, vs — 掩码复制**
+
+| 字段 | 值 | 说明 |
+|------|-----|------|
+| uop_op | 9'b0000_10000 | move (向量) |
+| src1_type | V | 向量寄存器 |
+| dst_type | V | 向量寄存器 |
+
+**vmnot.v vd, vs — 掩码取反**
+
+| 字段 | 值 | 说明 |
+|------|-----|------|
+| uop_op | 9'b0000_10001 | move (向量) |
+| sub_opcode[0] | 1'b1 | 取反标志 |
+
+**vfirst.m rd, vs — 查找首个 1 (位置→整数)**
+
+| 字段 | 值 | 说明 |
+|------|-----|------|
+| uop_op | 9'b0111_10100 | shift 类别 + 前导1扫描 |
+| exec_unit | VPU + ALU | 并行前导1计数 |
+| dst_type | 2'b00 | **整数寄存器** (返回索引) |
+| dst_reg | x[rd] | |
+
+##### E. 向量 Permutation UOP
+
+**vslideup.v / vslidedown.v — 向量移位（跨寄存器）**
+
+| 步骤 | UOP | 说明 |
+|------|-----|------|
+| 1 | UOP#1 | 初始化移位偏移 |
+| 2 | UOP#2..LMUL | 跨寄存器数据搬运 |
+
+**vsext.v / vzext.v — 向量符号/零扩展**
+
+| 指令 | src sew | dst sew | uop_op |
+|------|---------|---------|--------|
+| vsext.v | 8/16 | 16/32 | 9'b0000_10010 |
+| vzext.v | 8/16 | 16/32 | 9'b0000_10011 |
+
+**vmv.v.x vd, rs1 — 整数→向量复制（广播）**
+
+| 字段 | 值 | 说明 |
+|------|-----|------|
+| exec_unit | ALU | 整数寄存器→向量寄存器广播 |
+| src1_type | 2'b00 | **整数寄存器** |
+| src1_reg | x[rs1] | |
+| dst_type | 2'b10 | **向量寄存器** (广播到所有 lane) |
+| uop_op | 9'b0000_10002 | move (向量标量广播) |
+
+**vmv.x.s rd, vs — 向量[0]→整数**
+
+| 字段 | 值 | 说明 |
+|------|-----|------|
+| exec_unit | ALU | 向量 lane 0 直传到整数寄存器 |
+| src1_type | 2'b10 | **向量寄存器** |
+| src1_reg | v[vs] | |
+| dst_type | 2'b00 | **整数寄存器** |
+| uop_op | 9'b0000_10003 | move (向量标量提取) |
+
+---
+
+#### 16.3.11 浮点 / 向量 UOP 执行延迟与流水线冲突
+
+##### A. 浮点单元执行延迟
+
+| UOP 类别 | 示例指令 | 执行周期 | 流水线级 | 吞吐 (次/周期) |
+|---------|---------|---------|---------|--------------|
+| fadd/fsub/fneg/fabs | fadd.s | 2 | FPU_S: 2级 | 1/1 |
+| fmul | fmul.s | 3 | FPU_S: 3级 | 1/1 |
+| fdiv | fdiv.s | 6-28 | 迭代器 (14-28 cycles for d) | 1/8 |
+| fsqrt | fsqrt.s | 6-28 | 迭代器 | 1/8 |
+| FMA | fmadd.s | 4 | FPU_S: 4级 | 1/1 |
+| fcvt | fcvt.w.s | 3 | FPU_S + ALU | 1/1 |
+| fmin/fmax | fmin.s | 2 | FPU_S | 1/1 |
+| fclass | fclass.s | 1 | FPU_S | 1/1 |
+| fli | fli.s | 1 | ALU (立即数直写) | 1/1 |
+| fmv.x.s/fmv.s.x | fmv.x.s | 1 | **ALU** (无FPU参与) | 4/1 (全部ALU) |
+
+##### B. FPU 前递（Forwarding）路径
+
+| 源 UOP → 目标 UOP | 是否可前递 | 说明 |
+|-------------------|-----------|------|
+| fadd → fadd | ✅ | EXE_2 输出可直接前递到下一条 fadd src1 |
+| fmul → fadd | ✅ | MUL 3 级 → FADD 2 级，MUL 的 WB 到 FADD 的 SCH_READ |
+| fmul → fmul | ✅ | 流水线内部前递 |
+| fdiv → fadd | ❌ | 除法器延迟长 (6+ cycles)，需等待 WB |
+| fadd → fmv.x.s | ✅ | 写回后整数 ALU 直接读取 |
+| fadd → fcvt.w.s | ⚠️ 部分 | 需等 FPU 完成再送 ALU |
+
+##### C. 向量单元执行延迟（Zve64x + LMUL=1 + SEW=32）
+
+| UOP | 总执行周期 | 并行度 | 说明 |
+|-----|-----------|--------|------|
+| vadd.vv | ~4 | 2 lanes | 2 通道并行, 每通道 1 cycle/elem × 8 elems / 2 |
+| vmul.vv | ~8 | 2 lanes | 每通道 2 cycles/elem × 8 elems / 2 |
+| vle32.v | ~8 | 2 load + 2 lanes | cache 命中时: 每周期 4 elems |
+| vredsum.vs | ~7 (串行) / ~3 (树) | 串行/2-way | 串行: n-1 cycles; 树形: log2(n) + latency |
+| vmseq.vv | ~4 (生成mask) | 2 lanes | 写入 v0 掩码寄存器 |
+| vsetvli | 1 | CSR | 配置更新, 必须 barrier |
+| vslideup.v | ~8 | 串行 | 跨寄存器搬运无并行 |
+
+##### D. 向量流水线冲突与串行化
+
+| 冲突场景 | 处理 | 说明 |
+|---------|------|------|
+| 连续 vle → vadd | 无需串行 | load 完成后 add 自动进入就绪队列 |
+| vsetvli → 任意向量 UOP | **Barrier** | 必须保证配置更新完成 |
+| vredsum → vmv.x.s | **串行** | 归约写 vd[0] 后再提取到整数 |
+| 连续 sc.gather | **串行化 L1D 访问** | 每个元素独立地址，MSHR 队列串行处理 |
+| 向量 Store → 下一条 load (同一地址) | **Store-to-Load 前递** | 检测到同地址时旁路 store buffer |
+
+---
+
 ### 16.4 UOP 缓存设计（可选）
 
 #### 16.4.1 UOP 缓存配置
@@ -1503,6 +2083,8 @@ UOPOP[8:5] 类别映射表：
 
 #### 16.6.2 UOP 总数统计
 
+**基础标量 UOP（整数 + 浮点 F/D）：**
+
 | 类别 | UOP数量 | 说明 |
 |------|---------|------|
 | move | 6 | mov, zero, nop, neg, lui, auipc |
@@ -1521,7 +2103,32 @@ UOPOP[8:5] 类别映射表：
 | FP_compare | 5 | feq, flt, fle, fmin, fmax |
 | FP_convert | 8 | fcvt系列 (8种转换) |
 | FP_MA | 4 | fmadd, fmsub, fnmadd, fnmsub |
-| **总计** | **~86** | 基础UOP操作 |
+| **小计（基础标量）** | **~90** | 基础 RV64G UOP |
+
+**Zfa / Zicond 扩展 UOP：**
+
+| 扩展类别 | UOP数量 | 说明 |
+|---------|---------|------|
+| Zfa_ext (额外浮点) | 6 | fli(6值), fminm, fmaxm, fround, froundnx, fclass |
+| Zicond (条件置零) | 2 | czero.eqz, czero.nez |
+| **小计（扩展）** | **8** | |
+
+**向量 UOP（Zve64x + Zve64f）：**
+
+| 向量类别 | UOP数量 | 说明 |
+|---------|---------|------|
+| v_arith (加/减/乘/除) | ~12 | vadd/vsub/vrsub + vmul/vmulh + vdiv/vrem (每类 vv/vx/vi 变体) |
+| v_logic (and/or/xor) | 3 | |
+| v_shift (sll/srl/sra) | 3 | |
+| v_compare (mask生成) | 4 | vmseq, vmsne, vmslt, vmsle |
+| v_fp_arith | 7 | vfadd/vfsub/vfmul/vfdiv/vfmacc/vfmin/vfmax |
+| v_reduction | 8 | vredsum/vredand/vredor/vredmax/min 等 |
+| v_permute | 8 | vslideup/vslidedown/vsext/vzext/vmv.v.x/vmv.x.s/vfirst/vnot |
+| v_config | 1 | vsetvli/vsetvl |
+| v_load/store | 4 | unit-stride / stride / index / masked |
+| **小计（向量）** | **~50** | 向量 UOP（每个指令为 1+ 条内部循环 UOP）|
+
+**总计：约 148 个唯一 UOP 操作码（不含向量内部循环展开）**
 
 ---
 
@@ -1535,7 +2142,7 @@ UOPOP[8:5] 类别映射表：
 | | 发射宽度 | 4-wide |
 | | 流水线级数 | 14 stages (FETCH_1 → RETIREMENT) |
 | | 工作频率 | 1-2 GHz |
-| | Micro-Op架构 | 完整UOP (~86基础UOP) |
+| | Micro-Op架构 | 完整UOP (~148操作码, 基础标量~90 + Zfa~8 + 向量~50) |
 | | SMT | 2 threads |
 | **前端** | 分支预测 | TAGE-SC-L + Perceptron |
 | | BTB | 4K entries, 4-way |
