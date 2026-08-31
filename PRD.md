@@ -46,7 +46,7 @@
 | **架构** | RV64 超标量乱序执行核心 |
 | **发射宽度** | 4-宽（每周期最多发射4条指令） |
 | **多线程** | 支持 2-way SMT（同时多线程） |
-| **指令集** | G扩展 + 向量(V) + 压缩(C) + 预取 |
+| **指令集** | RV64G（含FMA）+ V(Zve64x) + C + Zfa + 预取 + Zicond |
 | **特权级** | M-mode + S-mode + U-mode |
 | **虚拟化** | 支持 Sv39 三级页表 |
 
@@ -109,13 +109,43 @@
 
 ### 3.3 浮点扩展
 
+**基础浮点扩展（必选，构成 RV64G 的浮点子集）：**
+
 | 扩展 | 状态 | 说明 |
 |------|------|------|
-| F 扩展 | ✅ 必选 | 单精度浮点 |
-| D 扩展 | ✅ 必选 | 双精度浮点 |
-| Zfinx | ✅ 必选 | 整数寄存器存浮点 |
-| Zfa | 🔲 可选 | 浮点附加指令 |
-| Zfhmin | 🔲 可选 | 半精度最小支持 |
+| **F 扩展** | ✅ 必选 | 单精度浮点（32-bit），含完整 FMA 指令 |
+| **D 扩展** | ✅ 必选 | 双精度浮点（64-bit），含完整 FMA 指令 |
+| **浮点寄存器** | ✅ 32 个独立寄存器 | f0-f31（独立于整数 x0-x31） |
+
+**F / D 扩展包含的完整指令清单：**
+
+| 指令类别 | 单精度 (.s) | 双精度 (.d) | 说明 |
+|---------|------------|------------|------|
+| **加/减** | fadd.s, fsub.s | fadd.d, fsub.d | |
+| **乘/除** | fmul.s, fdiv.s | fmul.d, fdiv.d | |
+| **开方** | fsqrt.s | fsqrt.d | |
+| **取负/绝对值** | fneg.s, fabs.s | fneg.d, fabs.d | |
+| **比较** | feq.s, flt.s, fle.s | feq.d, flt.d, fle.d | 结果写入**整数寄存器** |
+| **最小/最大** | fmin.s, fmax.s | fmin.d, fmax.d | |
+| **移动** | fmv.x.s, fmv.s.x, fmv.s.s | fmv.x.d, fmv.d.x, fmv.d.d | fmv.x.s / fmv.s.x 为 **bit级移动，走整数ALU** |
+| **类型转换** | fcvt.w.s, fcvt.s.w, fcvt.s.d, fcvt.d.s, fcvt.x.s, fcvt.s.x | fcvt.w.d, fcvt.d.w, fcvt.d.s, fcvt.s.d, fcvt.x.d, fcvt.d.x | |
+| **FMA（融合乘加）** | **fmadd.s, fmsub.s, fnmadd.s, fnmsub.s** | **fmadd.d, fmsub.d, fnmadd.d, fnmsub.d** | **单次舍入，硬件融合** |
+| **分类** | fclass.s | fclass.d | 结果写入**整数寄存器** |
+
+**附加浮点扩展：**
+
+| 扩展 | 状态 | 说明 |
+|------|------|------|
+| **Zfa** | ✅ 必选 | 浮点附加指令（fli, fminm, fmaxm, fround, froundnx） |
+| **Zicond** | ✅ 必选 | 整数条件置零（czero.eqz, czero.nez）— 虽为整数扩展但对浮点条件选择代码有优化 |
+| Zfhmin | 🔲 可选 | 半精度最小支持（仅 load/store/move） |
+| Zfinx | ❌ 不采用 | 整数寄存器存浮点（与 F/D 扩展独立浮点寄存器互斥） |
+
+**FMA 关键说明：**
+- FMA 是 F/D 扩展的**标准组成部分**，不是额外扩展
+- 4 条 FMA 指令（fmadd/fmsub/fnmadd/fnmsub）均为**单次舍入**融合操作
+- 数学定义：`fmadd rd, rs1, rs2, rs3  →  rd = (rs1 × rs2) + rs3`（中间不舍入，仅最终结果舍入）
+- 该特性对高性能浮点库（BLAS/FFT/深度学习）至关重要
 
 ### 3.4 压缩与扩展
 
@@ -131,11 +161,27 @@
 
 | 配置 | 规格 | 说明 |
 |------|------|------|
-| **扩展版本** | V 扩展 (Zve64x) | 最小硬件：64位 |
+| **基础整数向量** | V 扩展 (Zve64x) | 最小整数向量硬件，ELEN=64, VLEN=64 |
+| **向量单精度浮点** | Zve64f | 在 Zve64x 基础上增加 vfadd/vfmul/vfmacc 等 |
+| **向量双精度浮点** | Zve64d | 在 Zve64f 基础上增加 64-bit 向量浮点操作 |
 | **ELEN** | 64 bits | 最大元素宽度 |
 | **VLEN** | 64 bits | 寄存器宽度 |
 | **LMUL** | 1, 2, 4, 8 | 多种向量长度 |
 | **SEW** | 8-64 bits | 动态元素宽度 |
+
+**向量指令集覆盖（与 UOP 编码一一对应）：**
+
+| 类别 | 指令示例 | 对应 UOP |
+|------|---------|---------|
+| 算术（整数） | vadd.vv, vsub.vv, vmul.vv, vdiv.vv | v_arith |
+| 逻辑 | vand.vv, vor.vv, vxor.vv | v_logic |
+| 移位 | vsll.vv, vsrl.vv, vsra.vv | v_shift |
+| 比较 → mask | vmseq.vv, vmslt.vv | v_compare → v0 |
+| **浮点算术** | **vfadd.vv, vfmul.vv, vfmacc.vv** | **v_fp_arith** (Zve64f/Zve64d) |
+| 归约 | vredsum.vs, vredmaxu.vs | v_reduction |
+| Permutation | vslideup.v, vmv.v.x, vmv.x.s | v_permute |
+| 配置 | vsetvli, vsetvl | v_config |
+| Load/Store | vle32.v, vse32.v, vloxei32.v | v_load/store (4种寻址) |
 
 ### 3.6 预取扩展
 
