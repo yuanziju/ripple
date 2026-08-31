@@ -46,7 +46,7 @@
 | **架构** | RV64 超标量乱序执行核心 |
 | **发射宽度** | 4-宽（每周期最多发射4条指令） |
 | **多线程** | 支持 2-way SMT（同时多线程） |
-| **指令集** | RV64G（含FMA）+ V(Zve64x) + C + Zfa + 预取 + Zicond |
+| **指令集** | RV64G（含FMA）+ V(Zve64x + Zve64f + Zve64d) + C + Zfa + 预取 + Zicond |
 | **特权级** | M-mode + S-mode + U-mode |
 | **虚拟化** | 支持 Sv39 三级页表 |
 
@@ -541,10 +541,12 @@
 
 | 参数 | 配置 | 说明 |
 |------|------|------|
-| **架构** | 共享VPU | 复用整数ALU资源 |
+| **架构** | 共享VPU | 复用整数ALU + FPU资源 |
 | **执行方式** | 时分复用 | 多周期执行 |
-| **最小支持** | Zve64x | ELEN=64, VLEN=64 |
-| **元素宽度** | 8-64 bits (动态) | 通过vsetvl配置 |
+| **整数向量** | Zve64x | 基础整数向量，ELEN=64, VLEN=64 |
+| **单精度浮点向量** | Zve64f | 增加 32-bit 向量浮点操作 |
+| **双精度浮点向量** | Zve64d | 增加 64-bit 向量浮点操作 |
+| **元素宽度** | 8-64 bits (动态) | 通过vsetvl配置 SEW |
 
 #### 6.6.2 向量操作支持
 
@@ -1094,7 +1096,7 @@ endmodule: ripple_alu
 | 1 | L1 Cache 配置 | L1D:32KB 8-way, L1I:64KB 4-way | ✅ 已确认 |
 | 2 | L2 Cache 配置 | 512KB 8-way 统一 | ✅ 已确认 |
 | 3 | MSHR 数量 | 8 entries (L1D), 4 entries (L1I) | ✅ 已确认 |
-| 4 | 向量单元配置 | 共享VPU, Zve64x | ✅ 已确认 |
+| 4 | 向量单元配置 | 共享VPU, Zve64x + Zve64f + Zve64d | ✅ 已确认 |
 | 5 | Zfinx vs 标准浮点 | 标准浮点 (独立浮点寄存器) | ✅ 已确认 |
 | 6 | 分支预测器 | TAGE-SC-L + Perceptron | ✅ 已确认 |
 | 7 | 流水线级数 | 14 stages (FETCH_1 → RETIREMENT) | ✅ 已确认 |
@@ -1774,17 +1776,20 @@ vredsum.vs vd, vs2   // 向量求和归约
 | vmslt.vv | 9'b0010_10010 | v0 | V (掩码) | mask[i] = (vs1[i]<vs2[i]) |
 | vmsle.vv | 9'b0010_10011 | v0 | V (掩码) | mask[i] = (vs1[i]<=vs2[i]) |
 
-##### D. 向量浮点 UOP（Zve64f 扩展）
+##### D. 向量浮点 UOP（Zve64f 单精度 + Zve64d 双精度）
 
-| 指令 | uop_op | 执行单元 | 说明 |
+**关键设计：** .s 和 .d 变体复用同一组 UOP 操作码，通过 `sew` 字段区分（010=32-bit, 011=64-bit）。执行单元在运行时根据 sew 路由到 FPU_S 还是 FPU_D。
+
+| 指令 (.s / .d) | uop_op | 执行单元 | 说明 |
 |------|--------|----------|------|
-| vfadd.vv | 9'b1100_10000 | FPU_S/D + VPU | 向量浮点加 |
-| vfsub.vv | 9'b1100_10001 | FPU_S/D + VPU | 向量浮点减 |
-| vfmul.vv | 9'b1100_10010 | FPU_S/D + VPU | 向量浮点乘 |
-| vfdiv.vv | 9'b1100_10011 | FPU_S/D + VPU | 向量浮点除 |
-| vfmacc.vv | 9'b1111_10000 | FPU_S/D + VPU | 向量 FMA (vs1×vs2+vd→vd) |
-| vfmin.vv | 9'b1101_10000 | FPU_S/D + VPU | 向量浮点 min |
-| vfmax.vv | 9'b1101_10001 | FPU_S/D + VPU | 向量浮点 max |
+| vfadd.vv / vfadd.vv | 9'b1100_10000 | FPU_S 或 FPU_D + VPU | 向量浮点加 |
+| vfsub.vv / vfsub.vv | 9'b1100_10001 | FPU_S 或 FPU_D + VPU | 向量浮点减 |
+| vfmul.vv / vfmul.vv | 9'b1100_10010 | FPU_S 或 FPU_D + VPU | 向量浮点乘 |
+| vfdiv.vv / vfdiv.vv | 9'b1100_10011 | FPU_S 或 FPU_D + VPU | 向量浮点除 |
+| **vfmacc.vv / vfmacc.vv** | 9'b1111_10000 | FPU_S 或 FPU_D + VPU | **向量 FMA (vs1×vs2+vd→vd)** |
+| vfnmsac.vv | 9'b1111_10001 | FPU_S 或 FPU_D + VPU | 向量负 FMA |
+| vfmin.vv / vfmin.vv | 9'b1101_10000 | FPU_S 或 FPU_D + VPU | 向量浮点 min |
+| vfmax.vv / vfmax.vv | 9'b1101_10001 | FPU_S 或 FPU_D + VPU | 向量浮点 max |
 
 ---
 
@@ -2159,7 +2164,7 @@ UOPOP[8:5] 类别映射表：
 | Zicond (条件置零) | 2 | czero.eqz, czero.nez |
 | **小计（扩展）** | **8** | |
 
-**向量 UOP（Zve64x + Zve64f）：**
+**向量 UOP（Zve64x + Zve64f + Zve64d）：**
 
 | 向量类别 | UOP数量 | 说明 |
 |---------|---------|------|
@@ -2167,12 +2172,13 @@ UOPOP[8:5] 类别映射表：
 | v_logic (and/or/xor) | 3 | |
 | v_shift (sll/srl/sra) | 3 | |
 | v_compare (mask生成) | 4 | vmseq, vmsne, vmslt, vmsle |
-| v_fp_arith | 7 | vfadd/vfsub/vfmul/vfdiv/vfmacc/vfmin/vfmax |
+| v_fp_arith (.s 单精度) | 7 | vfadd/vfsub/vfmul/vfdiv/vfmacc/vfmin/vfmax (Zve64f) |
+| v_fp_arith (.d 双精度) | 7 | 同上但 SEW=64-bit (Zve64d，复用同一组 UOP 操作码，通过 sew 字段区分) |
 | v_reduction | 8 | vredsum/vredand/vredor/vredmax/min 等 |
 | v_permute | 8 | vslideup/vslidedown/vsext/vzext/vmv.v.x/vmv.x.s/vfirst/vnot |
 | v_config | 1 | vsetvli/vsetvl |
 | v_load/store | 4 | unit-stride / stride / index / masked |
-| **小计（向量）** | **~50** | 向量 UOP（每个指令为 1+ 条内部循环 UOP）|
+| **小计（向量）** | **~57** | 向量 UOP（不含内部循环展开；.s/.d 复用同一操作码，通过 sew 区分）|
 
 **总计：约 148 个唯一 UOP 操作码（不含向量内部循环展开）**
 
@@ -2184,11 +2190,11 @@ UOPOP[8:5] 类别映射表：
 
 | 类别 | 参数 | 值 |
 |------|------|-----|
-| **总体** | ISA | RV64G + V(Zve64x) + C + Zfa + 预取扩展 |
+| **总体** | ISA | RV64G（含FMA）+ V(Zve64x + Zve64f + Zve64d) + C + Zfa + Zicond + 预取扩展 |
 | | 发射宽度 | 4-wide |
 | | 流水线级数 | 14 stages (FETCH_1 → RETIREMENT) |
 | | 工作频率 | 1-2 GHz |
-| | Micro-Op架构 | 完整UOP (~148操作码, 基础标量~90 + Zfa~8 + 向量~50) |
+| | Micro-Op架构 | 完整UOP (~155操作码, 基础标量~90 + Zfa/Zicond~8 + 向量~57) |
 | | SMT | 2 threads |
 | **前端** | 分支预测 | TAGE-SC-L + Perceptron |
 | | BTB | 4K entries, 4-way |
@@ -2198,8 +2204,8 @@ UOPOP[8:5] 类别映射表：
 | **执行** | ALU | 4 × 64-bit |
 | | 乘法器 | 2 × 64×64, 3-stage pipeline, CPA复用 |
 | | 除法器 | 1 × Newton-Raphson, 8-entry queue |
-| | 向量单元 | Shared VPU, Zve64x |
-| | 浮点单元 | FPU_S/D (单/双精度) |
+| | 向量单元 | Shared VPU, Zve64x + Zve64f + Zve64d |
+| | 浮点单元 | FPU_S/D (单/双精度, 含融合FMA) |
 | | 加载单元 | 2 × Load |
 | | 存储单元 | 1 × Store |
 | | 分支单元 | 2 × BRU (fast + regular) |
