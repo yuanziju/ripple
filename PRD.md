@@ -283,51 +283,152 @@
 
 ### 5.1 分支预测器 (Branch Predictor)
 
+> **实现语言**: Chisel (Scala)，非 SystemVerilog。接手的HDL工程师需使用 Chisel/FIRRTL 框架。
+
 #### 5.1.1 总体架构
 
-| 组件 | 配置 | 说明 |
+```
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                         RIPPLE 分支预测器 架构总览                              │
+├─────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                 │
+│  ┌──────────────┐   ┌──────────────┐   ┌──────────────┐   ┌──────────────┐    │
+│  │  2-Ahead     │   │  TAGE-SC-L   │   │  Perceptron  │   │    ITAGE     │    │
+│  │  调度器       │──▶│  主预测器     │──▶│  (H2P辅助)   │──▶│  间接跳转    │    │
+│  │  (3窗口)     │   │  8 Tag表     │   │  ~16KB       │   │  2 Tag表     │    │
+│  └──────────────┘   └──────────────┘   └──────────────┘   └──────────────┘    │
+│         │                                                                       │
+│         ▼                                                                       │
+│  ┌──────────────┐   ┌──────────────┐                                           │
+│  │  BTB L1      │   │  BTB L2      │   ┌──────────────┐                       │
+│  │  8K 8way     │──▶│  32K 16way   │──▶│  RAS 48 ent  │                       │
+│  │  双端口       │   │              │   │              │                       │
+│  └──────────────┘   └──────────────┘   └──────────────┘                       │
+│                                                                                 │
+└─────────────────────────────────────────────────────────────────────────────────┘
+```
+
+| 组件 | 配置 | 说明 | 对标参考 |
+|------|------|------|---------|
+| **主预测器** | TAGE-SC-L | 8 Tag表 + Statistical Corrector + Loop Predictor | CBP 2016 冠军基线 |
+| **2-Ahead 前端** | Zen5式全功能 | 每周期2分支预测 + 3预测窗口 | AMD Zen5 (2024) |
+| **H2P辅助预测器** | Perceptron ~16KB | 仅处理Hard-to-Predict分支，资源受限 | Bullseye论文 + Zen5辅助 |
+| **间接跳转预测** | ITAGE 2 Tag表 | 独立间接跳转目标表 | 工业界通用 |
+| **BTB L1** | 8K entries 8-way **双端口** | 零延迟分支目标命中 | Zen5 16K但我们平衡面积 |
+| **BTB L2** | 32K entries 16-way | L1驱逐的回退缓存 | Panther Lake级别的大容量 |
+| **RAS** | 48 entries | 函数调用返回预测 | Zen5 52entries/Intel经典32 |
+| **Loop Predictor** | 集成于SC-L内 | 固定迭代次数循环检测 | TAGE-SC-L 标配 |
+| **Statistical Corrector** | 集成于SC-L内 | 2-bit饱和计数器校正 | TAGE-SC-L 标配 |
+
+#### 5.1.2 TAGE-SC-L 主预测器配置
+
+| 参数 | 值 | 说明 |
+|------|-----|------|
+| **完整名称** | TAGE-SC-L (TAgged GEometric + Statistical Correction + Loop detector) | 工业界基线预测器 |
+| **Tag表数量** | 8 个 | 覆盖不同全局历史长度 |
+| **全局历史长度分配** | **6, 10, 14, 18, 24, 32, 44, 58** | 更长偏移间隔（非等差/非指数），适合SPEC workload |
+| **Tag宽度** | 10–14 bits | 各表可能不同，长历史用更宽Tag |
+| **Statistical Corrector (SC)** | ✅ 必选 | 独立2-bit饱和计数器表，校正TAGE预测偏差，MPKI降5-8% |
+| **Loop Predictor (L)** | ✅ 必选 | 识别for/while循环迭代次数，退出准确率60%→95%+ |
+| **Useful计数器** | ✅ 每表2-bit | 动态调整Tag表优先级，低Useful表被淘汰 |
+| **预测延迟** | 2 cycles | TAGE查表+Tag匹配计算 |
+| **存储预算** | ~160-180 KB | TAGE-SC-L 主预测器 + Perceptron H2P 子系统 |
+
+**历史长度设计理由**：
+- 等差序列（如5,7,9,11...）覆盖密集短中历史，SPEC workload表现好
+- 指数序列（4,8,16,32...）覆盖超长历史，适合递归/模板嵌套
+- **我们选的更长偏移版本（6,10,14,18,24,32,44,58）** 是Zen5/Intel Panther Lake可能用的变体——在长历史区间更密集，对H2P分支更友好
+
+#### 5.1.3 2-Ahead Branch Predictor
+
+| 参数 | 配置 | 说明 |
 |------|------|------|
-| **主预测器** | TAGE-SC-L | 高精度预测器 |
-| **辅助预测器** | Perceptron | 针对TAGE难以预测分支 |
-| **间接跳转预测** | ITAGE | 间接跳转目标预测 |
-| **返回栈** | RAS (32 entries) | 函数调用返回预测 |
-| **分支目标缓冲** | BTB (4K entries) | 缓存分支目标地址 |
-| **依赖识别** | 长城依赖检测 | 强相关分支依赖识别 |
+| **实现方式** | Zen5式全功能 | 每周期处理2个非连续分支 |
+| **预测窗口数** | 3个 | 可向前看见更多分支 |
+| **BTB配合** | 必须双端口 | L1 BTB需支持每周期2次查询 |
+| **IPC提升预期** | +3-5% | 相比单路TAGE |
+| **复杂度代价** | 显著增加 | 双路取指/解码配合，3个窗口调度逻辑 |
+| **学术来源** | 1995 ISCA论文（Ahead Pipelining） | AMD Zen5首次商用化，时隔30年 |
 
-#### 5.1.2 TAGE 预测器配置
+#### 5.1.4 Perceptron H2P 辅助预测器
 
+> **设计原则**：资源受限！仅专门处理 Hard-to-Predict (H2P) 分支，不做全量Perceptron。
+
+| 参数 | 配置 | 说明 |
+|------|------|------|
+| **总存储预算** | **~16 KB** | 受限，按需使用 |
+| **触发条件** | TAGE对该分支MPKI > 阈值 | 仅在TAGE连续预测错误N次后接管 |
+| **H2P识别机制** | Hard-to-Predict Identification Table (HIT) | 饱和计数器记录每个分支的TAGE误预测率 |
+| **网络结构** | 2-3层（输入层 + 隐藏层） | 单/双Perceptron并行，一个用局部历史、一个用全局历史 |
+| **Trial阶段** | ✅ | 新H2P分支先用Perceptron试运行N次，准确率>阈值才正式接管 |
+| **抑制策略** | ✅ | 被Perceptron接管的分支，TAGE更新被抑制，避免Perceptron被TAGE污染 |
+| **学术参考** | Bullseye Predictor (CBP 2025) | HIT表 + Trial + 抑制策略均来自此论文 |
+
+#### 5.1.5 ITAGE 间接跳转预测器
+
+| 参数 | 配置 | 说明 |
+|------|------|------|
+| **架构** | TAGE变体 | 针对间接跳转（indirect jump/branch）优化 |
+| **Tag表数量** | **2 个** | 短历史表 + 长历史表 |
+| **历史长度** | 8, 24 | 一个短窗口、一个长窗口 |
+| **独立目标表** | ✅ | 专门存储间接跳转的目标地址历史（类似BTB但专门给ITAGE用） |
+| **存储预算** | ~2-4 KB | 远小于BTB |
+| **准确率预期** | > 90% | 函数指针/虚函数密集负载提升5-10% |
+| **触发范围** | 仅 indirect jump/branch | 不处理conditional branch |
+
+#### 5.1.6 两级 BTB (Branch Target Buffer)
+
+| 级别 | 容量 | 相联度 | 端口 | 延迟 | 说明 |
+|------|------|--------|------|------|------|
+| **L1 BTB** | **8,192 entries** | **8-way** | **双端口**（支持2-Ahead） | **1 cycle** | 零延迟命中，每way 64B（无别名） |
+| **L2 BTB** | **32,768 entries** | **16-way** | 单端口 | **2-3 cycles** | L1驱逐回退，更大覆盖 |
+
+**L1 BTB 详细规格**：
 | 参数 | 值 | 说明 |
 |------|-----|------|
-| **预测器名称** | TAGE-SC-L | TAgged GEometric length predictor with Statistical Correction and Loop detector |
-| **历史长度** | 5-11 (几何级数) | 不同长度的历史窗口 |
-| **表数量** | 8 个 tag tables | 对应不同历史长度 |
-| **Tag宽度** | 8-12 bits | 标签宽度 |
-| **预测延迟** | 2 cycles | 预测计算延迟 |
+| Tag宽度 | 40 bits (虚拟地址) | VA[19:6] + ASID |
+| 数据宽度 | 40 bits (目标地址) | 存储下一条指令PC |
+| 端口数 | **2个读端口** + 1个写端口 | 2-Ahead需要每周期查2个BTB entry |
+| 访问方式 | VIPT | 虚拟索引+物理Tag |
 
-#### 5.1.3 BTB 配置
-
+**L2 BTB 详细规格**：
 | 参数 | 值 | 说明 |
 |------|-----|------|
-| **容量** | 4096 entries | 4K条目 |
-| **相联度** | 4-way | 四路组相联 |
-| **Tag宽度** | ~40 bits | 标签位宽 |
-| **数据宽度** | ~40 bits | 目标地址 |
+| Tag宽度 | 40 bits (虚拟地址) | VA[19:6] + ASID |
+| 数据宽度 | 40 bits (目标地址) | 存储下一条指令PC |
+| 访问方式 | PIPT | 物理索引+物理Tag |
+| 填充策略 | L1 Miss时触发 | 从L1驱逐的entry同时写入L2 |
 
-#### 5.1.4 RAS 配置
+#### 5.1.7 RAS (Return Address Stack)
 
-| 参数 | 值 | 说明 |
-|------|-----|------|
-| **深度** | 32 entries | 返回栈深度 |
-| **操作** | push/pop | 函数调用/返回 |
-| **预测延迟** | 1 cycle | 快速返回预测 |
+| 参数 | 配置 | 说明 |
+|------|------|------|
+| **深度** | **48 entries** | 平衡深度与面积（Zen5:52, Intel传统:32） |
+| **操作模式** | push（函数调用）/ pop（函数返回） | L1I取指时识别call/ret指令 |
+| **预测延迟** | 1 cycle | 快速返回路径，优先级高于BTB |
+| **Wrap-around** | ✅ | 超过48 entries时覆盖最旧 |
+| **历史更新** | ret时pop + 验证 | 真实返回后弹出，push的PC保留至被消费 |
+| **单条存储开销** | 48 × 40bit = **240B** | 面积几乎可忽略 |
 
-#### 5.1.5 性能指标
+#### 5.1.8 整体性能指标
 
 | 指标 | 目标值 | 说明 |
 |------|--------|------|
-| **分支预测准确率** | > 98.5% | 平均MPKI < 5 |
-| **间接跳转准确率** | > 90% | ITAGE增强后 |
-| **返回栈命中率** | > 99% | RAS预测 |
+| **条件分支MPKI** | **< 3.5** | SPEC2017 Integer，比纯TAGE-SC-L低15-20% |
+| **间接跳转MPKI** | **< 2.0** | ITAGE + 两级BTB配合 |
+| **返回栈命中率** | **> 99.5%** | 48 entries深度足够绝大多数嵌套 |
+| **平均分支预测准确率** | **> 98.7%** | 含H2P分支Perceptron纠正 |
+| **预测带宽** | 2 branches/cycle | 2-Ahead全功能 |
+
+#### 5.1.9 与其他模块的配合
+
+| 配合模块 | 接口 | 说明 |
+|----------|------|------|
+| **Fetch Stage** | PC生成 + Cache地址 | 分支预测的PC直接驱动L1I取指 |
+| **2-Ahead双路取指** | 每周期2组取指请求 | 第一组用当前PC，第二组用预测的分支目标 |
+| **RAS/BTB与2-Ahead** | 每周期查2次 | 双端口BTB + 双路RAS push/pop |
+| **Perceptron裁决** | 最后时刻覆盖TAGE | Perceptron在TAGE和BTB之后给出最终方向 |
+| **Loop与SC更新** | Resolve Stage写回 | 分支真实执行后更新预测器历史 |
 
 ### 5.2 指令取指 (Instruction Fetch)
 
@@ -1018,99 +1119,238 @@ fmadd.d rd, rs1, rs2, rs3   // rd = (rs1 × rs2) + rs3  [单次舍入]
 
 ### 8.1 L1 Cache
 
-#### 8.1.1 L1 数据缓存 (L1D)
+#### 8.1.1 索引方式总览：VIPT（Virtually-Indexed, Physically-Tagged）
+
+> **为什么用VIPT？** 现代CPU L1 Cache几乎全用VIPT——让Cache访问和TLB地址翻译**并行执行**，隐藏地址翻译延迟。但VIPT有**别名风险**，需满足 `(Cache Size / Associativity) ≤ Page Size`。
+
+| Cache | 索引方式 | Index来源 | Tag来源 | 别名检查 |
+|-------|---------|----------|---------|---------|
+| **L1D** | **VIPT** | VA[11:6]（仅page offset） | PA[39:6]（物理地址高位） | ✅ **无别名**（48KB/12way=4KB=page） |
+| **L1I** | **VIPT** | VA[11:6]（仅page offset） | PA[39:6]（物理地址高位） | ✅ **无别名**（64KB/16way=4KB=page） |
+| **L2** | **PIPT** | PA（完整物理地址） | PA[39:6] | ✅ PIPT天生无别名 |
+
+**VIPT 别名安全验证**（关键！）：
+```
+L1D: 48KB ÷ 12-way = 4KB/way = 4KB page → ✅ Set index 只用 page offset bits，零别名
+L1I: 64KB ÷ 16-way = 4KB/way = 4KB page → ✅ 原来 4-way 有别名！现在升级到 16-way 修复
+L2:  512KB ÷ 8-way = 64KB/way > 4KB → ⚠️ 必须用 PIPT（不用VIPT），已正确选择
+```
+
+**SIPT（Speculatively-Indexed）可行性备注**：
+> 学术界HPCA 2018提出的SIPT用1-3位预测位超出page offset做虚拟索引，预测错率<3%，可让L1做更大+更低associativity。**PRD记录此方向，暂不采用**，后续如有工艺/面积约束再重新评估。
+
+#### 8.1.2 L1 数据缓存 (L1D) — **48KB 12-way VIPT**
 
 | 参数 | 配置 | 说明 |
 |------|------|------|
-| **容量** | 32 KB | 每线程16KB |
-| **相联度** | 8-way | 八路组相联 |
+| **容量** | **48 KB** | 每线程独立 |
+| **相联度** | **12-way** | 12路组相联 |
 | **行大小** | 64 bytes | 缓存行大小 |
-| **组数** | 64 sets | 32K/(8×64) |
-| **Tag宽度** | 40 bits | 标签位宽 |
-| **访问延迟** | 4 cycles (命中) | Load-to-use延迟 |
-| **Bank数** | 4 banks | 支持并发访问 |
-| **替换策略** | Pseudo-LRU | 伪LRU替换 |
+| **组数** | 64 sets | 48K/(12×64) = 64 sets |
+| **Index位** | VA[11:6] (6 bits) | 仅用page offset，和TLB并行 |
+| **Tag位** | PA[39:6] (34 bits) | 物理地址高位 + ASID[8:0] |
+| **访问延迟** | 4 cycles (命中) | Load-to-use延迟，48KB大Cache仍保持4-cycle |
+| **Bank数** | 4 banks | 支持并发load访问 |
+| **替换策略** | Pseudo-LRU | 伪LRU替换（多way扩展版） |
 | **写策略** | Write-Back | 回写策略 |
+| **索引方式** | **VIPT** | 虚拟索引 + 物理Tag，✅ 无别名 |
+| **ASID支持** | ✅ 9-bit ASID | Tag中包含ASID，避免跨进程别名 |
+| **对标参考** | AMD Zen5 (48KB 12-way) | Zen5也升级到48KB 12-way，保持无别名 |
 
-#### 8.1.2 L1 指令缓存 (L1I)
+#### 8.1.3 L1 指令缓存 (L1I) — **64KB 16-way VIPT**
+
+> ⚠️ **关键修复**：原64KB 4-way有严重别名问题（64/4=16KB > 4KB page）！升级到16-way，每way 4KB，和page size对齐。
 
 | 参数 | 配置 | 说明 |
 |------|------|------|
-| **容量** | 64 KB | 单线程共享 |
-| **相联度** | 4-way | 四路组相联 |
+| **容量** | **64 KB** | 单线程共享 |
+| **相联度** | **16-way** | 16路组相联（修复别名必需） |
 | **行大小** | 64 bytes | 缓存行大小 |
-| **组数** | 256 sets | 64K/(4×64) |
-| **Tag宽度** | 38 bits | 标签位宽 |
-| **访问延迟** | 4 cycles (命中) | 取指延迟 |
-| **Bank数** | 4 banks | 支持并发取指 |
+| **组数** | 64 sets | 64K/(16×64) = 64 sets |
+| **Index位** | VA[11:6] (6 bits) | 仅用page offset |
+| **Tag位** | PA[39:6] (34 bits) | 物理地址高位 + ASID[8:0] |
+| **访问延迟** | 4 cycles (命中) | 取指延迟，2-Ahead双路取指需要L1I双端口 |
+| **端口需求** | **2 read ports** | 2-Ahead每周期需要2次取指 |
+| **Bank数** | 4 banks | 分bank支持并发取指 |
 | **替换策略** | Pseudo-LRU | 伪LRU替换 |
-| **写策略** | Read-Only | 只读缓存 |
+| **写策略** | Read-Only | 只读缓存（指令不会被写） |
+| **索引方式** | **VIPT** | ✅ 无别名（原4-way有别名，16-way修复） |
 
-#### 8.1.3 L1 Cache 特性
+#### 8.1.4 L1 Cache 共性特性
 
-| 特性 | 支持 | 说明 |
-|------|------|------|
-| **非阻塞访问** | ✅ | Miss时不阻塞CPU |
-| **MSHR追踪** | ✅ | 支持未完成Miss追踪 |
-| **请求合并** | ✅ | 同地址请求合并 |
-| **预取支持** | ✅ | 硬件预取指示 |
-| **Cache维护** | ✅ | CBO指令支持 |
-| **ECC保护** | 🔲 可选 | 错误检测纠正 |
+| 特性 | L1D | L1I | 说明 |
+|------|-----|-----|------|
+| **非阻塞访问** | ✅ | ✅ | Miss时不阻塞CPU |
+| **MSHR追踪** | ✅ 8 entries | ✅ 4 entries | 支持未完成Miss追踪 |
+| **请求合并** | ✅ | ✅ | 同地址请求合并 |
+| **预取支持** | ✅ 完整（Berti+2D Stride） | ✅ IP Prefetcher | 硬件预取 + 软件预取 |
+| **Cache维护** | ✅ CBO指令 | ✅ CBO指令 | Zicbom/Zicboz/Zicbop支持 |
+| **Coherence** | ✅ | ✅ | VIPT天生支持简单Coherence（Tag是物理地址） |
+| **ECC保护** | 🔲 可选 | ❌ 不需要 | L1D可选加ECC，L1I面积敏感 |
+| **替换策略** | Pseudo-LRU | Pseudo-LRU | 伪LRU（多way扩展版） |
 
-### 8.2 L2 Cache
+### 8.2 L2 Cache — **512KB 8-way PIPT**
 
-#### 8.2.1 L2 配置
+> L2用PIPT（Physically-Indexed Physically-Tagged），因为L2访问频率低一级，TLB翻译隐藏不再是必需的。PIPT天生无别名，Coherence简单。
 
 | 参数 | 配置 | 说明 |
 |------|------|------|
-| **容量** | 512 KB | 单核心私有 |
-| **相联度** | 8-way | 八路组相联 |
+| **容量** | **512 KB** | 单核心私有 |
+| **相联度** | **8-way** | 八路组相联 |
 | **行大小** | 64 bytes | 缓存行大小 |
 | **组数** | 1024 sets | 512K/(8×64) |
-| **Tag宽度** | 32 bits | 标签位宽 |
+| **索引方式** | **PIPT** | 物理索引 + 物理Tag，✅ 天生无别名 |
+| **Index位** | PA[15:6] (10 bits) | 完整物理地址索引 |
+| **Tag位** | PA[39:16] (24 bits) | 物理地址高位 |
 | **访问延迟** | 10 cycles (命中) | L2访问延迟 |
 | **Bank数** | 4 banks | 分bank设计 |
 | **替换策略** | Pseudo-LRU | 伪LRU替换 |
 | **写策略** | Write-Back | 回写策略 |
-| **组织方式** | Unifies (I+D共享) | 统一缓存 |
-
-#### 8.2.2 L2 Cache 特性
-
-| 特性 | 支持 | 说明 |
-|------|------|------|
-| **非阻塞访问** | ✅ | 支持并发Miss |
-| **MSHR** | ✅ | 8 entries MSHR |
-| **L1-L2 互联** | ✅ | 64B/cycle 总线 |
-| ** Victim Cache** | ❌ | 不需要，L2容量足够 |
-| **预取引擎** | 🔲 可选 | 硬件预取器 |
-| **ECC保护** | ✅ | 单比特纠错 |
+| **组织方式** | Unified (I+D共享) | 统一缓存，指令和数据共享L2 |
+| **Coherence** | ✅ 简单 | PIPT天然支持，Tag是物理地址 |
+| **预取引擎** | ✅ **BertiGO** | DPC 2026冠军，L2专用 |
+| **ECC保护** | ✅ | 单比特纠错（面积预算允许） |
 
 ### 8.3 MSHR 配置
 
 | 参数 | 配置 | 说明 |
 |------|------|------|
-| **MSHR总数** | 8 entries | L1D MSHR |
-| **L1I MSHR** | 4 entries | 指令缓存MSHR |
-| **L2 MSHR** | 8 entries | L2级MSHR |
-| **请求合并** | ✅ | 相同地址合并 |
-| **追踪方式** | 显式寻址 | 存储完整地址 |
+| **L1D MSHR** | 8 entries | 追踪L1D Miss，Berti预取也会用 |
+| **L1I MSHR** | 4 entries | 追踪L1I Miss，配合2-Ahead取指 |
+| **L2 MSHR** | 8 entries | 追踪L2 Miss，BertiGO预取也会用 |
+| **请求合并** | ✅ 每层 | 相同地址的demand miss和prefetch合并 |
+| **追踪方式** | 显式寻址 | 存储完整物理地址 |
+| **Coherence** | ✅ | MSHR也参与Cache Coherence协议 |
 
-### 8.4 预取器
+### 8.4 硬件预取器系统
 
-| 预取类型 | 配置 | 说明 |
-|---------|------|------|
-| **L2 预取器** | 自适应预取器 | 基于历史模式 |
-| **预取深度** | 4-8 行 | 预取深度 |
-| **触发条件** | Cache Miss | Miss触发预取 |
-| **RISC-V提示** | Zicbop指令 | 软件预取提示 |
+> **设计理念**：L1D用轻量高准确率预取器（Berti+2D Stride混合），L2用更智能但面积更大的预取器（BertiGO）。所有预取器硬件实现，软件预取作为补充。
+
+#### 8.4.1 预取器层级架构
+
+```
+  ┌──────────────────────────────────────────────────────────────────┐
+  │                      RIPPLE 预取器 层级总览                     │
+  ├──────────────────────────────────────────────────────────────────┤
+  │                                                                  │
+  │  CPU Load/Store ──▶ L1D Cache Miss ──▶ L1D Prefetcher          │
+  │                                          │                      │
+  │                    ┌─────────────────────┤                      │
+  │                    │                     │                      │
+  │                    ▼                     ▼                      │
+  │              ┌────────────┐      ┌────────────┐                │
+  │              │    Berti   │      │ 2D Stride  │                │
+  │              │ (per-page  │      │ (Zen5同款) │                │
+  │              │  delta)    │      │            │                │
+  │              └─────┬──────┘      └─────┬──────┘                │
+  │                    │                     │                      │
+  │                    └─────────┬───────────┘                      │
+  │                              ▼                                  │
+  │                     Prefetch Request ──▶ L1D Fill Queue        │
+  │                                                                  │
+  │  L2 Cache Miss ──▶ L2 Prefetcher                                │
+  │                         │                                       │
+  │                    ┌────┴────┐                                  │
+  │                    ▼         ▼                                  │
+  │              ┌──────────┐ ┌──────────────┐                     │
+  │              │ BertiGO  │ │ 经典流预取    │                     │
+  │              │ (DPC'26) │ │ (多流+NextLine)│                    │
+  │              └─────┬────┘ └──────┬───────┘                     │
+  │                    │              │                              │
+  │                    └──────┬───────┘                              │
+  │                           ▼                                     │
+  │                  Prefetch Request ──▶ L2 Fill Queue              │
+  │                                                                  │
+  │  IP Prefetcher (指令) ──▶ L1I Prefetch Queue                    │
+  │                                                                  │
+  └──────────────────────────────────────────────────────────────────┘
+```
+
+#### 8.4.2 L1D 数据预取器 — **Berti + 2D Stride 混合**
+
+| 预取器 | 算法 | 核心思想 | 触发条件 | 存储预算 |
+|--------|------|---------|----------|---------|
+| **Berti（主）** | Per-Page Delta Tracking | 每个Load PC独立追踪该**当前页面内**的访问delta模式，即使执行乱序也能精确匹配 | L1D Miss 或 预取命中 | ~8-12 KB |
+| **2D Stride（辅）** | 改进跨步检测（Zen5同款） | 检测2D数组/矩阵遍历模式（行列交替跨步），覆盖Berti盲区 | L1D Miss | ~4-8 KB |
+
+**Berti 详细机制**：
+| 参数 | 配置 | 说明 |
+|------|------|------|
+| 历史追踪粒度 | **Per-page**（不是全地址） | 只在当前page内记录delta，避免跨page污染 |
+| 触发条件 | L1D Miss 或 预取命中（prefetch hit也算） | 比只在Miss触发更积极 |
+| 模式匹配 | 当前PC + 当前page → 查delta history table | 找到历史delta序列后，预测下一个delta |
+| 准确率优势 | 即使Load被乱序执行也能精确匹配 | 解决传统stride prefetcher的乱序问题 |
+| DPC地位 | DPC 2022冠军，**所有DPC参赛者都用了Berti** | L1D领域绝对SOTA |
+
+**2D Stride 详细机制**（Zen5同款）：
+| 参数 | 配置 | 说明 |
+|------|------|------|
+| 检测目标 | 数组/矩阵的行列遍历 | 2D访问模式是Berti的盲区 |
+| 模式识别 | 行跨步 + 列跨步 + 行尾跳转 | 同时追踪两个方向的跨步 |
+| 优先级 | 低于Berti | Berti先匹配，2D Stride补充Berti覆盖不到的 |
+| IPC提升 | 对图像/矩阵/科学计算 workload 5-10% | Zen5报告的2D Stride效果 |
+
+**L1D 预取预算总计**：~12-20 KB（Berti + 2D Stride + 辅助逻辑）
+
+#### 8.4.3 L2 数据预取器 — **BertiGO（DPC 2026 冠军）**
+
+| 参数 | 配置 | 说明 |
+|------|------|------|
+| **完整名称** | BertiGO（Berti + Group + Optimization） | DPC 2026 综合冠军 |
+| **核心改进1** | **Region-Based Bit-Map Filter** | 完全相联结构，每Region存储bit-vector标记已预取/已访问的cache line，**过滤冗余预取** |
+| **核心改进2** | **多PC上下文索引** | 不仅用当前PC，还用 shifted-XOR(最后4个PC) 索引Berti表，**增加上下文信息** |
+| **核心改进3** | **Set-Dueling 动态策略选择** | 5个不同策略（包括"No-Prefetch"）每10M instruction比一次，选最优 |
+| **核心改进4** | **Adaptive Next Line (ANeLin) 扩展到LLC** | 采样cache追踪demand miss，动态开关Next Line预取 |
+| **存储预算** | **128 KB** | DPC规定的L2预算上限 |
+| **全带宽IPC提升** | **+17.2%** vs 官方baseline | DPC 2026数据 |
+| **ML工作负载提升** | **+27.7%** | AI/ML workload特别受益 |
+
+**经典预取器作为补充**（硬件全实现，可动态开关）：
+| 经典预取器 | 功能 | 默认状态 |
+|-----------|------|---------|
+| **Next Line Prefetcher (L1D)** | 取当前miss行的下一行 | ✅ 开启 |
+| **Stream Prefetcher (L2)** | 检测连续跨步访问流 | ✅ 开启 |
+| **IP Prefetcher (L1I)** | 指令预取器，检测取指跨步 | ✅ 开启 |
+| **L1 Next Page** | 取下一整页（4KB） | ⚠️ 关闭（激进，可能污染） |
+
+#### 8.4.4 软件预取指令支持 — **Zicbop + Zicboz + Zicbom**
+
+> **态度**：软件+硬件并重。硬件预取覆盖绝大多数场景，软件预取作为编译器的主动补充。
+
+| RISC-V扩展 | 指令 | 功能 | 支持 | 硬件实现 |
+|-----------|------|------|------|---------|
+| **Zicbop** | `prefetch.r` / `prefetch.w` | 预取到L1（read/write提示） | ✅ 完整支持 | 特殊Load指令，直接触发L1D填充 |
+| **Zicboz** | `prefetch.i` | 预取指令到L1I | ✅ 完整支持 | 特殊取指指令，直接触发L1I填充 |
+| **Zicbom** | `prefetch.r_to_l2` / `prefetch.w_to_l2` 等 | 预取到指定缓存层级 | ✅ 完整支持 | 特殊Store指令，可指定目标层级（L1/L2/LLC/MM） |
+| **Zicbop (LLC)** | `prefetch.r_to_l3` | 预取到LLC | ✅ 完整支持 | RISC-V 1.1版扩展指令 |
+
+**软件预取特点**：
+| 特性 | 说明 |
+|------|------|
+| **编译器支持** | LLVM/RISC-V编译器自动插入（`-fprefetch-loops`） |
+| **语义** | 和普通Load/Store指令同级，不产生异常（即使地址非法也静默忽略） |
+| **与硬件预取配合** | 软件预取填充硬件预取器覆盖不到的模式（如不规则指针链） |
+| **性能收益** | 对gcc/lu等workload，编译器插入的预取指令贡献5-8% IPC |
+
+#### 8.4.5 预取节流与控制
+
+| 参数 | 配置 | 说明 |
+|------|------|------|
+| **硬件预取动态开关** | ✅ 每个预取器可独立开关 | 通过配置寄存器动态调整 |
+| **预取度（degree）** | 动态可调 1-8 | 密集模式预取更多行，稀疏模式更保守 |
+| **带宽感知** | ✅ | 当DDR带宽利用率>80%时，自动降低预取度 |
+| **Set-Dueling** | ✅ BertiGO内置 | 多策略竞争，自动选最优 |
+| **软件可配置** | ✅ 通过MSR/CSR | 固件可根据负载特性调整预取策略 |
 
 ### 8.5 存储队列
 
 | 队列 | 容量 | 说明 |
 |------|------|------|
-| **Load Queue** | 16 entries | OoO加载队列 |
-| **Store Queue** | 16 entries | OoO存储队列 |
-| **Write Buffer** | 16 entries | L2写缓冲 |
+| **Load Queue** | 32 entries | OoO加载队列（可并发处理更多load） |
+| **Store Queue** | 32 entries | OoO存储队列（支持store合并） |
+| **Write Buffer** | 16 entries | L2写缓冲（write-back的暂存区） |
+| **Fill Queue** | 8 entries | L1D预取填充队列 |
+| **预取合并** | ✅ | 相同地址的demand和prefetch请求合并 |
 
 ---
 
@@ -1416,7 +1656,7 @@ endmodule: ripple_alu
 
 | 编号 | 决策项 | 确认方案 | 状态 |
 |------|--------|---------|------|
-| 1 | L1 Cache 配置 | L1D:32KB 8-way, L1I:64KB 4-way | ✅ 已确认 |
+| 1 | L1 Cache 配置 | L1D:48KB 12-way VIPT, L1I:64KB 16-way VIPT | ✅ 已确认 |
 | 2 | L2 Cache 配置 | 512KB 8-way 统一 | ✅ 已确认 |
 | 3 | MSHR 数量 | 8 entries (L1D), 4 entries (L1I) | ✅ 已确认 |
 | 4 | 向量单元配置 | 共享VPU, Zve64x + Zve64f + Zve64d | ✅ 已确认 |
@@ -2544,8 +2784,8 @@ UOPOP[8:5] 类别映射表：
 | | Micro-Op架构 | 完整UOP (~155操作码, 基础标量~90 + Zfa/Zicond~8 + 向量~57) |
 | | SMT | 2 threads |
 | **前端** | 分支预测 | TAGE-SC-L + Perceptron |
-| | BTB | 4K entries, 4-way |
-| | RAS | 32 entries |
+| | BTB | L1 8K 8-way双端口 + L2 32K 16-way |
+| | RAS | 48 entries |
 | | 取指宽度 | 4 instr/cycle |
 | | 预译码 | C扩展解压 + 指令分类 |
 | **执行** | ALU | 8 × 64-bit (6 标量 + 2 VPU lane 专用), 5 KSA + 3 CLA |
@@ -2562,8 +2802,8 @@ UOPOP[8:5] 类别映射表：
 | | 整型PRF | 192 entries |
 | | 浮点PRF | 96 entries |
 | | SMT | 2 threads |
-| **缓存** | L1D | 32KB 8-way, 4 banks |
-| | L1I | 64KB 4-way, 4 banks |
+| **缓存** | L1D | 48KB 12-way VIPT, 4 banks |
+| | L1I | 64KB 16-way VIPT, 4 banks |
 | | L2 | 512KB 8-way 统一, 4 banks |
 | | MSHR | 8 entries (L1D), 4 entries (L1I) |
 | | UOP缓存 | 256 entries (可选) |
